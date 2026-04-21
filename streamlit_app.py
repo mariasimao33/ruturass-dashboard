@@ -18,8 +18,15 @@ st.set_page_config(
 LEGEND_MD = """
 **Legenda das métricas**
 
-- **Ruturas**: máquina **sem numerário** ou com **saldo < 500€**  
-- **Indisponíveis**: **inoperacional** (fora de serviço)  
+**Definições**
+- **Ruturas**: máquina **sem numerário** ou com **saldo < 500€**
+- **Indisponíveis**: **inoperacional** (fora de serviço)
+
+**Leitura dos indicadores**
+- **Δ vs média móvel (7 dias)**: **vermelho = piora**, **verde = melhora** (métricas onde “maior = pior”)
+
+**Nota operacional**
+- Em comunicações à rede, pode existir regra operacional de referência para **VTM ~ 2.000€** (ex.: “limite de rutura” por VTM) — alinhar com o normativo/processo vigente.
 """
 
 # Linha do topo com logo e título
@@ -91,7 +98,6 @@ else:
 with c_title:
     st.markdown("<h1 style='margin-bottom:0;'>Ruturas Dashboard</h1>", unsafe_allow_html=True)
 
-st.write("Carrega um ficheiro CSV")
 
 # -------------------------------------------------------------------------
 # Helpers / Constantes
@@ -316,7 +322,18 @@ def read_uploaded_csv_v2(file):
 # Upload + cache em disco
 # -------------------------------------------------------------------------
 import os, io, hashlib, pickle
-from datetime import datetime
+from datetime import datetime, timezone
+
+def _fmt_dt_iso_to_local(isoz: str) -> str:
+    """Converte '2026-04-21T12:34:56Z' -> '2026-04-21 13:34' (hora local do servidor)."""
+    try:
+        dt = datetime.fromisoformat(isoz.replace("Z", "+00:00"))
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(isoz)
+
+def _now_local_str() -> str:
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
 
 PERSIST_DIR = ".streamlit_cache"
 os.makedirs(PERSIST_DIR, exist_ok=True)
@@ -399,14 +416,56 @@ else:
     df_daily = cache["df_daily"]
     df_just = cache["df_just"]
     df_events = cache["df_events"]
-    st.caption(f"A usar dados guardados em disco ({cache['meta']['saved_at']}).")
+    saved_at_local = _fmt_dt_iso_to_local(cache["meta"].get("saved_at", ""))
+    st.caption(f"📌 A usar dados guardados em disco. Última atualização: **{saved_at_local}**.")
 
 # Se chegaste aqui → df_daily está garantido
 if df_daily is None or df_daily.empty:
     st.error("Cache ou ficheiro inválido. Carrega novo ficheiro.")
     st.stop()
 
-last_date = df_daily["Data"].max()
+# Data mais recente disponível nos dados
+max_date = df_daily["Data"].max()
+min_date = df_daily["Data"].min()
+
+# Lista de datas disponíveis (para fallback se escolher um dia sem registos)
+_available_dates = pd.Series(df_daily["Data"].dropna().unique()).sort_values()
+
+# -------------------------
+# Resumo executivo (topo)
+# -------------------------
+cache_info = load_cache()
+last_refresh = None
+if cache_info and cache_info.get("meta", {}).get("saved_at"):
+    last_refresh = _fmt_dt_iso_to_local(cache_info["meta"]["saved_at"])
+else:
+    last_refresh = _now_local_str()
+
+
+# -------------------------
+# Data de referência (Indicadores) — escolhível
+# -------------------------
+_sel = st.date_input(
+    "Dia (indicadores)",
+    value=max_date.date(),   # default: o mais recente
+    min_value=min_date.date(),
+    max_value=max_date.date(),
+    format="DD/MM/YYYY",     # ✅ formato português
+    key="kpi_day",
+)
+
+kpi_date = pd.to_datetime(_sel).normalize()
+
+# Se o dia escolhido não tiver dados (ex.: fim de semana), faz fallback para a última data <= escolhida
+if kpi_date not in set(_available_dates.values):
+    fallback = _available_dates[_available_dates <= kpi_date]
+    if not fallback.empty:
+        kpi_date = pd.to_datetime(fallback.iloc[-1]).normalize()
+        st.caption(f"ℹ️ Sem dados no dia selecionado. A mostrar **{kpi_date.date().isoformat()}** (último dia disponível).")
+    else:
+        kpi_date = max_date
+        st.caption(f"ℹ️ Sem datas anteriores. A mostrar **{kpi_date.date().isoformat()}**.")
+
 
 # -------------------------------------------------------------------------
 # Utilitários de KPIs
@@ -470,12 +529,16 @@ def render_main_kpi(metrica: str, v_geral: float, m7_geral: float):
 # -------------------------------------------------------------------------
 # KPIs — Destaque GERAL (soma ATM+VTM) + legenda dentro da secção
 # -------------------------------------------------------------------------
-h1, h2 = st.columns([0.92, 0.08])
+h1, h2, h3 = st.columns([0.55, 0.30, 0.15])
 
 with h1:
-    st.header(f"Indicadores — {last_date.date().isoformat()}")
+    st.header("Indicadores do dia")
 
 with h2:
+    # o date_input já foi criado acima; aqui só deixo um “alinhamento visual”
+    st.caption(" ")
+
+with h3:
     if hasattr(st, "popover"):
         with st.popover("ℹ️", help="Legenda das métricas"):
             st.markdown(LEGEND_MD)
@@ -489,21 +552,22 @@ tab_geral, tab_ag, tab_for = st.tabs([DISPLAY_FONTE["GERAL"], DISPLAY_FONTE["Ag�
 for tab, fonte_tab in zip([tab_geral, tab_ag, tab_for], ["GERAL", "Agências", "Esegur"]):
     with tab:
         if fonte_tab == "GERAL":
-            sub_today = df_daily[(df_daily["Data"] == last_date) & (df_daily["Canal"] == "GERAL")]
+            sub_today = df_daily[(df_daily["Data"] == kpi_date) & (df_daily["Canal"] == "GERAL")]
         else:
             sub_today = df_daily[
-                (df_daily["Data"] == last_date)
+                (df_daily["Data"] == kpi_date)
                 & (df_daily["Fonte"] == fonte_tab)
                 & (df_daily["Canal"] == "GERAL")
             ]
+
         if sub_today.empty:
-            st.info(f"Sem dados para {DISPLAY_FONTE[fonte_tab]} no dia {last_date.date().isoformat()}.")
+            st.info(f"Sem dados para {DISPLAY_FONTE[fonte_tab]} no dia {kpi_date.date().isoformat()}.")
             continue
 
         # >>> ALTERAÇÃO: KPIs principais só com 2 métricas
         cols = st.columns(2)
         for metrica, cc in zip(METRICS, cols):
-            v_geral, m7_geral = today_and_ma7(df_daily, fonte_tab, "GERAL", metrica, last_date)
+            v_geral, m7_geral = today_and_ma7(df_daily, fonte_tab, "GERAL", metrica, kpi_date)
             with cc:
                 render_main_kpi(metrica, v_geral, m7_geral)
 
@@ -511,8 +575,9 @@ for tab, fonte_tab in zip([tab_geral, tab_ag, tab_for], ["GERAL", "Agências", "
         with st.expander("Detalhe por canal (ATM / VTM)"):
             c1, c2 = st.columns(2)
             for metrica, cont in zip(METRICS, [c1, c2]):
-                v_atm, m7_atm = today_and_ma7(df_daily, fonte_tab, "ATM", metrica, last_date)
-                v_vtm, m7_vtm = today_and_ma7(df_daily, fonte_tab, "VTM", metrica, last_date)
+                v_atm, m7_atm = today_and_ma7(df_daily, fonte_tab, "ATM", metrica, kpi_date)
+                v_vtm, m7_vtm = today_and_ma7(df_daily, fonte_tab, "VTM", metrica, kpi_date)
+
                 with cont:
                     st.caption(f"**{metrica}**")
                     d_atm = None if pd.isna(m7_atm) else f"{'+' if (v_atm - m7_atm) >= 0 else ''}{int(round(v_atm - m7_atm))}"
@@ -540,13 +605,15 @@ fonte_sel = label_to_internal[fonte_sel_label]
 # >>> ALTERAÇÃO: selectbox só com 2 métricas
 met_sel = st.selectbox("Métrica", METRICS, index=0)
 
+# ✅ Texto sem siglas
+show_m7 = st.checkbox("Mostrar média móvel (7 dias)", value=False)
+show_vals = st.checkbox("Mostrar valores diários", value=True)  # ✅ NOVO (default = mostrar)
+
 if fonte_sel == "GERAL":
-    # Somar fontes para ATM/VTM e manter GERAL (soma final)
     base = df_daily[
         (df_daily["Metrica"] == met_sel) & (df_daily["Canal"].isin(["ATM", "VTM", "GERAL"]))
     ].copy()
 
-    # ATM/VTM: somar por data e canal; GERAL já existe como soma por fonte (vamos somar também por data)
     df_atm_vtm = (
         base[base["Canal"].isin(["ATM", "VTM"])]
         .groupby(["Data", "Canal"], as_index=False)["Valor"]
@@ -573,27 +640,65 @@ else:
 if df_chart.empty:
     st.info("Sem dados para o filtro escolhido.")
 else:
-    chart = (
-        alt.Chart(df_chart)
-        .mark_line(strokeWidth=2)
-        .encode(
-            x=alt.X("Data:T", title="Data", axis=alt.Axis(format="%Y-%m-%d")),
-            y=alt.Y("Valor:Q", title="Valor"),
-            color=alt.Color("Canal:N", title=None, scale=alt.Scale(scheme="tableau10")),
-            tooltip=[
-                alt.Tooltip("Data:T", title="Data", format="%Y-%m-%d"),
-                alt.Tooltip("Canal:N", title="Canal"),
-                alt.Tooltip("Valor:Q", title=met_sel, format=".0f"),
-            ],
+    base_tooltip = [
+        alt.Tooltip("Data:T", title="Data", format="%Y-%m-%d"),
+        alt.Tooltip("Canal:N", title="Canal"),
+        alt.Tooltip("Valor:Q", title=met_sel, format=".0f"),
+    ]
+
+    layers = []
+
+    # ✅ Linhas “normais” (valores diários)
+    if show_vals:
+        layers.append(
+            alt.Chart(df_chart)
+            .mark_line(strokeWidth=2)
+            .encode(
+                x=alt.X("Data:T", title="Data", axis=alt.Axis(format="%Y-%m-%d")),
+                y=alt.Y("Valor:Q", title="Valor"),
+                color=alt.Color("Canal:N", title=None, scale=alt.Scale(scheme="tableau10")),
+                tooltip=base_tooltip,
+            )
         )
-        .properties(height=340)
-    )
-    st.altair_chart(chart, use_container_width=True)
+
+    # ✅ Média móvel (7 dias) — tracejada e mais suave
+    if show_m7:
+        tmp = df_chart.sort_values(["Canal", "Data"]).copy()
+        tmp["MM7"] = tmp.groupby("Canal")["Valor"].transform(
+            lambda s: s.rolling(window=7, min_periods=3).mean()
+        )
+        df_mm7 = tmp.dropna(subset=["MM7"]).loc[:, ["Data", "Canal", "MM7"]].rename(columns={"MM7": "Valor"})
+
+        if not df_mm7.empty:
+            layers.append(
+                alt.Chart(df_mm7)
+                .mark_line(strokeWidth=2, strokeDash=[6, 4], opacity=0.55)
+                .encode(
+                    x=alt.X("Data:T", title="Data", axis=alt.Axis(format="%Y-%m-%d")),
+                    y=alt.Y("Valor:Q", title="Valor"),
+                    color=alt.Color("Canal:N", title=None, scale=alt.Scale(scheme="tableau10")),
+                    tooltip=base_tooltip,  # sem “Real/M7” no tooltip
+                )
+            )
+
+    if not layers:
+        st.info("Marca pelo menos uma opção: valores diários ou média móvel.")
+    else:
+        chart = (
+            alt.layer(*layers)
+            .properties(height=360, padding={"left": 8, "right": 18, "top": 6, "bottom": 28})
+            .configure_axisX(
+                titlePadding=18,   # ✅ dá espaço entre ticks e o título "Data"
+                labelPadding=8     # ✅ dá espaço para labels do eixo
+            )
+        )
+
+        st.altair_chart(chart, use_container_width=True)
 
 # -------------------------------------------------------------------------
 # JUSTIFICAÇÕES — Matriz diária (geral) + Gráfico (Agências) via registos
 # -------------------------------------------------------------------------
-st.header("Justificações")
+st.header("Justificações do dia")
 
 # 1) Matriz diária (geral)
 if df_just is None or df_just.empty:
@@ -603,23 +708,45 @@ else:
     sem_col = sem_col_candidates[0] if sem_col_candidates else None
 
     # Top 2 do último dia (exclui 'Sem justificação')
-    st.subheader("Top 2 — último dia (geral)")
-    if "Data" in df_just.columns:
-        last_date_just = df_just["Data"].max()
-        df_last = df_just[df_just["Data"] == last_date_just].copy()
+    # Top 2 — dia selecionado nos indicadores (geral)
+
+if "Data" in df_just.columns:
+    # datas disponíveis nas justificações
+    just_dates = pd.Series(df_just["Data"].dropna().unique()).sort_values()
+
+    ref_just_date = kpi_date
+
+    # fallback se não existir exatamente nesse dia
+    if ref_just_date not in set(just_dates.values):
+        fallback = just_dates[just_dates <= ref_just_date]
+        if not fallback.empty:
+            ref_just_date = pd.to_datetime(fallback.iloc[-1]).normalize()
+            st.caption(
+                f"ℹ️ Sem justificações no dia selecionado. "
+                f"A mostrar **{ref_just_date.date().isoformat()}** (último dia disponível)."
+            )
+        else:
+            st.info("Sem dados de justificações disponíveis.")
+            ref_just_date = None
+
+    if ref_just_date is not None:
+        df_last = df_just[df_just["Data"] == ref_just_date].copy()
         cand_cols = [c for c in df_last.columns if c != "Data" and c != sem_col]
+
         if df_last.empty or not cand_cols:
-            st.info("Sem dados de justificações para o último dia.")
+            st.info(f"Sem dados de justificações para o dia {ref_just_date.date().isoformat()}.")
         else:
             s_vals = df_last[cand_cols].iloc[0].astype(float)
             top2 = s_vals.sort_values(ascending=False).head(2)
+
             colA, colB = st.columns(2)
             with colA:
                 st.metric(top2.index[0], int(top2.iloc[0]))
             with colB:
                 if len(top2) > 1:
                     st.metric(top2.index[1], int(top2.iloc[1]))
-            with st.expander("Ver todas as categorias (último dia)"):
+
+            with st.expander("Ver todas as categorias (no dia selecionado)"):
                 st.dataframe(
                     s_vals.sort_values(ascending=False)
                     .reset_index()
@@ -710,9 +837,18 @@ if (df_events is None) or df_events.empty or ("AgenciaEmpresa" not in df_events.
 else:
     col_t1, col_t2 = st.columns(2)
     with col_t1:
-        periodo_top = st.selectbox("Período", ["Tudo", "1 semana", "Mês", "Ano", "1-3 Anos"], index=2, key="periodo_top")
+        periodo_top = st.selectbox(
+            "Período",
+            ["Tudo", "1 semana", "Mês", "Ano", "1-3 Anos"],
+            index=2,
+            key="periodo_top"
+        )
     with col_t2:
-        just_opts2 = ["Todas"] + sorted([j for j in df_events["Justificacao"].dropna().unique()]) if "Justificacao" in df_events.columns else ["Todas"]
+        just_opts2 = (
+            ["Todas"] + sorted([j for j in df_events["Justificacao"].dropna().unique()])
+            if "Justificacao" in df_events.columns
+            else ["Todas"]
+        )
         just_sel2 = st.selectbox("Justificação", just_opts2, index=0, key="just_top")
 
     def filtro_periodo_top(df, periodo_label: str):
@@ -725,23 +861,46 @@ else:
         return df[(df["Data"] >= start_date) & (df["Data"] <= end_date)].copy()
 
     top_df = df_events.copy()
-    # Excluir Fornecedores (Esegur)
-    top_df = top_df[top_df["Fonte"] == "Agências"]
+
+    # Excluir Fornecedores (Esegur) -> manter só Agências
+    if "Fonte" in top_df.columns:
+        top_df = top_df[top_df["Fonte"] == "Agências"]
+
+    # Janela temporal
     top_df = filtro_periodo_top(top_df, periodo_top)
+
+    # Filtro por Justificação (se aplicável)
     if just_sel2 != "Todas" and "Justificacao" in top_df.columns:
         top_df = top_df[top_df["Justificacao"] == just_sel2]
 
     if top_df.empty:
         st.info("Sem dados para o filtro selecionado.")
     else:
-        topN = (
+        # Contagens por agência
+        base_counts = (
             top_df.dropna(subset=["AgenciaEmpresa"])
             .groupby("AgenciaEmpresa", dropna=False)
             .size()
-            .sort_values(ascending=False)
-            .head(5)
             .rename("Ocorrencias")
+            .sort_values(ascending=False)
+        )
+
+        total_all = int(base_counts.sum()) if len(base_counts) else 0
+
+        topN = (
+            base_counts.head(5)
             .reset_index()
+            .assign(
+                SharePct=lambda d: np.where(
+                    total_all > 0, (d["Ocorrencias"] / total_all * 100), 0
+                )
+            )
+        )
+
+        # Label “enterprise”: ocorrências + % do total
+        topN["Label"] = topN.apply(
+            lambda r: f"{int(r['Ocorrencias'])} ({r['SharePct']:.0f}%)",
+            axis=1
         )
 
         chart_top = (
@@ -750,18 +909,33 @@ else:
             .encode(
                 x=alt.X("Ocorrencias:Q", title="Ocorrências"),
                 y=alt.Y("AgenciaEmpresa:N", title="Agência", sort="-x"),
-                tooltip=["AgenciaEmpresa:N", alt.Tooltip("Ocorrencias:Q", title="Ocorrências")],
+                tooltip=[
+                    alt.Tooltip("AgenciaEmpresa:N", title="Agência"),
+                    alt.Tooltip("Ocorrencias:Q", title="Ocorrências"),
+                    alt.Tooltip("SharePct:Q", title="% do total", format=".0f"),
+                ],
             )
             .properties(height=240)
         )
+
         labels = (
             alt.Chart(topN)
-            .mark_text(align="left", dx=4, color="#333")
-            .encode(x="Ocorrencias:Q", y=alt.Y("AgenciaEmpresa:N", sort="-x"), text="Ocorrencias:Q")
+            .mark_text(align="left", dx=6, color="#333")
+            .encode(
+                x="Ocorrencias:Q",
+                y=alt.Y("AgenciaEmpresa:N", sort="-x"),
+                text="Label:N",
+            )
         )
+
         st.altair_chart((chart_top + labels), use_container_width=True)
+
         with st.expander("Ver tabela"):
-            st.dataframe(topN, use_container_width=True, hide_index=True)
+            st.dataframe(
+                topN.rename(columns={"AgenciaEmpresa": "Agência"}),
+                use_container_width=True,
+                hide_index=True
+            )
 
 # -------------------------------------------------------------------------
 # Recomendações (bullet points) — só para 2 métricas
@@ -905,13 +1079,30 @@ def _top_agencias_e_playbook(df_events, end_date, days=30, max_ag=5):
         out.append({"agencia": ag, "ocorr": int(n), "share": share, "justs": topj, "acoes": actions[:3]})
     return out
 
+def _owner_por_fonte(fonte: str) -> str:
+    if fonte == "Agências":
+        return "Owner: Rede/Agências"
+    if fonte == "Esegur":
+        return "Owner: Fornecedores (Esegur)"
+    return "Owner: Operação (CO-Anomalias)"
+
+def _next_action_hint(fonte: str, metrica: str, canal_dom: str) -> str:
+    # Curto, executável
+    if metrica.lower().startswith("rutur"):
+        if fonte == "Esegur":
+            return f"Próxima ação: ajustar frequência/janelas de carregamento no canal {canal_dom} (piloto 2 semanas)."
+        return f"Próxima ação: priorizar abastecimento/rota e validar níveis alvo no canal {canal_dom}."
+    else:
+        if fonte == "Esegur":
+            return f"Próxima ação: revisar SLA e reincidências no canal {canal_dom}; acionar manutenção preventiva."
+        return f"Próxima ação: abrir ticket técnico + checklist local no canal {canal_dom} (equipamentos reincidentes)."
 
 try:
     if df_daily.empty:
         st.info("Sem dados para gerar recomendações.")
         st.stop()
 
-    ref = last_date
+    ref = kpi_date
 
     # 1) Painel de Risco por Fonte x Métrica (GERAL = soma ATM+VTM)
     blocos = []
@@ -1001,7 +1192,7 @@ try:
         for j in topj:
             acts = _playbook_para_justificacao(j)[:3]
             if acts:
-                bullets.append(f"🟠 **Justificação dominante** _{j}_ → " + "; ".join(acts))
+                bullets.append(f"🟠 **Justificação dominante** _{j}_ → " + "; ".join(acts) + f" — _{_owner_por_fonte('Agências')}_")
 
     if top_ag_play:
         for item in top_ag_play[:3]:
